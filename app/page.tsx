@@ -121,7 +121,7 @@ export default function Home() {
     setJDs(prev => prev.map(j =>
       j.id === jdId ? {
         ...j, candidates: j.candidates.map(c =>
-          c.id === candidateId ? { ...c, uploading: true } : c
+          c.id === candidateId ? { ...c, uploading: true, cv_text: null } : c
         )
       } : j
     ))
@@ -131,7 +131,11 @@ export default function Home() {
       const res = await fetch('/api/parse-pdf', { method: 'POST', body: formData })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      if (data.text) await updateCandidate(jdId, candidateId, 'cv_text', data.text)
+      if (data.text) {
+        await updateCandidate(jdId, candidateId, 'cv_text', data.text)
+        const fileName = file.name.replace('.pdf', '').replace(/_/g, ' ')
+        await updateCandidate(jdId, candidateId, 'name', fileName)
+      }
     } catch (err) {
       console.error('Upload failed:', err)
       alert('Failed to parse PDF. Try pasting the CV text manually.')
