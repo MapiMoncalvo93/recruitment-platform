@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 
 interface Analysis {
   score: number
@@ -17,24 +17,25 @@ interface Analysis {
 interface Candidate {
   id: string
   name: string
-  cv_text: string
-  call_notes: string
+  cv_text: string | null
+  call_notes: string | null
   status: string
   analyses: Analysis[]
+  uploading?: boolean
 }
 
 interface JD {
   id: string
   title: string
-  content: string
+  content: string | null
   candidates: Candidate[]
+  collapsed?: boolean
 }
 
 export default function Home() {
   const [jds, setJDs] = useState<JD[]>([])
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'pipeline' | 'dashboard'>('pipeline')
-  const [analyzing, setAnalyzing] = useState<string | null>(null)
+  const [analyzing, setAnalyzing] = useState<Set<string>>(new Set())
 
   useEffect(() => { fetchJDs() }, [])
 
@@ -52,24 +53,30 @@ export default function Home() {
       body: JSON.stringify({ title: 'New Role', content: '' })
     })
     const jd = await res.json()
-    setJDs(prev => [jd, ...prev])
+    setJDs(prev => [{ ...jd, candidates: [], collapsed: false }, ...prev])
   }
 
-  async function updateJD(id: string, title: string, content: string) {
+  async function updateJD(id: string, field: 'title' | 'content', value: string) {
+    setJDs(prev => prev.map(j => j.id === id ? { ...j, [field]: value } : j))
     await fetch('/api/jds', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, title, content })
+      body: JSON.stringify({ id, [field]: value })
     })
   }
 
   async function deleteJD(id: string) {
+    if (!confirm('Delete this role and all its candidates?')) return
     await fetch('/api/jds', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id })
     })
     setJDs(prev => prev.filter(j => j.id !== id))
+  }
+
+  function toggleCollapse(id: string) {
+    setJDs(prev => prev.map(j => j.id === id ? { ...j, collapsed: !j.collapsed } : j))
   }
 
   async function addCandidate(jdId: string) {
@@ -79,273 +86,280 @@ export default function Home() {
       body: JSON.stringify({ jd_id: jdId, name: 'New Candidate', cv_text: '' })
     })
     const candidate = await res.json()
-    setJDs(prev => prev.map(j => j.id === jdId ? { ...j, candidates: [...(j.candidates || []), candidate] } : j))
+    setJDs(prev => prev.map(j =>
+      j.id === jdId ? { ...j, candidates: [...(j.candidates || []), { ...candidate, analyses: [] }] } : j
+    ))
   }
 
-  async function updateCandidate(id: string, jdId: string, fields: Partial<Candidate>) {
+  async function updateCandidate(jdId: string, candidateId: string, field: string, value: string) {
+    setJDs(prev => prev.map(j =>
+      j.id === jdId ? {
+        ...j, candidates: j.candidates.map(c =>
+          c.id === candidateId ? { ...c, [field]: value } : c
+        )
+      } : j
+    ))
     await fetch('/api/candidates', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, ...fields })
+      body: JSON.stringify({ id: candidateId, [field]: value })
     })
-    setJDs(prev => prev.map(j => j.id === jdId ? {
-      ...j,
-      candidates: j.candidates.map(c => c.id === id ? { ...c, ...fields } : c)
-    } : j))
   }
 
-  async function uploadPDF(file: File, candidateId: string, jdId: string) {
-    const formData = new FormData()
-    formData.append('file', file)
-    const res = await fetch('/api/parse-pdf', { method: 'POST', body: formData })
-    const data = await res.json()
-    if (data.text) {
-      await updateCandidate(candidateId, jdId, { cv_text: data.text })
-    }
-  }
-
-  async function analyzeCandidate(jd: JD, candidate: Candidate) {
-    setAnalyzing(candidate.id)
-    const res = await fetch('/api/analyze', {
-      method: 'POST',
+  async function deleteCandidate(jdId: string, candidateId: string) {
+    await fetch('/api/candidates', {
+      method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        candidateId: candidate.id,
-        jdContent: jd.content,
-        cvText: candidate.cv_text,
-        callNotes: candidate.call_notes
-      })
+      body: JSON.stringify({ id: candidateId })
     })
-    const reader = res.body!.getReader()
-    const decoder = new TextDecoder()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      const lines = decoder.decode(value).split('\n')
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
-        try {
-          const data = JSON.parse(line.slice(6))
-          if (data.done) { fetchJDs(); setAnalyzing(null) }
-        } catch {}
-      }
+    setJDs(prev => prev.map(j =>
+      j.id === jdId ? { ...j, candidates: j.candidates.filter(c => c.id !== candidateId) } : j
+    ))
+  }
+
+  async function uploadPDF(jdId: string, candidateId: string, file: File) {
+    setJDs(prev => prev.map(j =>
+      j.id === jdId ? {
+        ...j, candidates: j.candidates.map(c =>
+          c.id === candidateId ? { ...c, uploading: true } : c
+        )
+      } : j
+    ))
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await fetch('/api/parse-pdf', { method: 'POST', body: formData })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      if (data.text) await updateCandidate(jdId, candidateId, 'cv_text', data.text)
+    } catch (err) {
+      console.error('Upload failed:', err)
+      alert('Failed to parse PDF. Try pasting the CV text manually.')
+    } finally {
+      setJDs(prev => prev.map(j =>
+        j.id === jdId ? {
+          ...j, candidates: j.candidates.map(c =>
+            c.id === candidateId ? { ...c, uploading: false } : c
+          )
+        } : j
+      ))
     }
   }
 
-  const totalCandidates = jds.reduce((a, j) => a + (j.candidates?.length || 0), 0)
-  const highMatch = jds.reduce((a, j) => a + (j.candidates?.filter(c => c.analyses?.[0]?.score >= 80).length || 0), 0)
-  const analyzed = jds.reduce((a, j) => a + (j.candidates?.filter(c => c.analyses?.length > 0).length || 0), 0)
+  async function analyze(jdId: string, candidateId: string) {
+    const jd = jds.find(j => j.id === jdId)
+    const candidate = jd?.candidates.find(c => c.id === candidateId)
+    if (!jd || !candidate) return
 
-  if (loading) return <div className="min-h-screen flex items-center justify-center text-gray-400">Loading...</div>
+    setAnalyzing(prev => new Set(prev).add(candidateId))
 
-  return (
-    <main className="min-h-screen bg-gray-50 p-6">
-      <div className="max-w-5xl mx-auto">
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">CV × JD Matcher</h1>
-            <p className="text-gray-400 text-sm">Recruitment automation platform</p>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => setActiveTab('pipeline')} className={`px-4 py-2 rounded-lg text-sm font-medium ${activeTab === 'pipeline' ? 'bg-blue-600 text-white' : 'bg-white border text-gray-600'}`}>Pipeline</button>
-            <button onClick={() => setActiveTab('dashboard')} className={`px-4 py-2 rounded-lg text-sm font-medium ${activeTab === 'dashboard' ? 'bg-blue-600 text-white' : 'bg-white border text-gray-600'}`}>Dashboard</button>
-          </div>
-        </div>
+    try {
+      const res = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          candidateId,
+          jdContent: jd.content,
+          cvText: candidate.cv_text,
+          callNotes: candidate.call_notes
+        })
+      })
+      const data = await res.json()
+      if (data.result) {
+        setJDs(prev => prev.map(j =>
+          j.id === jdId ? {
+            ...j, candidates: j.candidates.map(c =>
+              c.id === candidateId ? { ...c, analyses: [data.result, ...(c.analyses || [])] } : c
+            )
+          } : j
+        ))
+      }
+    } finally {
+      setAnalyzing(prev => {
+        const next = new Set(prev)
+        next.delete(candidateId)
+        return next
+      })
+    }
+  }
 
-        {activeTab === 'dashboard' && (
-          <div>
-            <div className="grid grid-cols-3 gap-4 mb-6">
-              <div className="bg-white rounded-xl border p-4 text-center"><div className="text-3xl font-bold">{jds.length}</div><div className="text-gray-400 text-sm">Active roles</div></div>
-              <div className="bg-white rounded-xl border p-4 text-center"><div className="text-3xl font-bold">{totalCandidates}</div><div className="text-gray-400 text-sm">CVs screened</div></div>
-              <div className="bg-white rounded-xl border p-4 text-center"><div className="text-3xl font-bold text-green-600">{highMatch}</div><div className="text-gray-400 text-sm">≥80% match</div></div>
-            </div>
-            <div className="flex flex-col gap-4">
-              {jds.map(jd => {
-                const hi = jd.candidates?.filter(c => c.analyses?.[0]?.score >= 80).length || 0
-                const total = jd.candidates?.length || 0
-                return (
-                  <div key={jd.id} className="bg-white rounded-xl border p-4">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="font-semibold">{jd.title}</div>
-                      <span className={`text-xs px-2 py-1 rounded-full font-medium ${hi >= 3 ? 'bg-green-100 text-green-700' : hi >= 1 ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>
-                        {hi >= 3 ? 'Strong pipeline' : hi >= 1 ? 'Building' : 'Needs sourcing'}
-                      </span>
-                    </div>
-                    <div className="text-sm text-gray-500">{hi} of {total} candidates ≥80% match</div>
-                    <div className="mt-3 flex flex-col gap-2">
-                      {(jd.candidates || []).filter(c => c.analyses?.[0]).sort((a, b) => (b.analyses[0]?.score || 0) - (a.analyses[0]?.score || 0)).map(c => (
-                        <div key={c.id} className="flex items-center gap-3 text-sm">
-                          <span className="w-7 h-7 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center text-xs font-semibold">{(c.name || '?')[0]}</span>
-                          <span className="flex-1">{c.name}</span>
-                          <span className={`text-xs px-2 py-1 rounded-full font-medium ${c.analyses[0].score >= 80 ? 'bg-green-100 text-green-700' : c.analyses[0].score >= 60 ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{c.analyses[0].score}%</span>
-                          <span className="text-xs text-gray-400">{c.status}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
+  const statusColors: Record<string, string> = {
+    screened: 'bg-gray-100 text-gray-600',
+    interviewing: 'bg-blue-100 text-blue-700',
+    offer: 'bg-green-100 text-green-700',
+    rejected: 'bg-red-100 text-red-600',
+  }
 
-        {activeTab === 'pipeline' && (
-          <div>
-            <div className="flex justify-between items-center mb-4">
-              <span className="text-sm text-gray-400">{jds.length} role{jds.length !== 1 ? 's' : ''}</span>
-              <button onClick={addJD} className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium">+ Add role</button>
-            </div>
-            <div className="flex flex-col gap-4">
-              {jds.map(jd => (
-                <div key={jd.id} className="bg-white rounded-xl border overflow-hidden">
-                  <div className="bg-gray-50 p-4 flex items-center gap-3">
-                    <input defaultValue={jd.title} onBlur={e => updateJD(jd.id, e.target.value, jd.content)} className="flex-1 bg-transparent font-semibold text-gray-800 outline-none" />
-                    <span className="text-xs text-gray-400">{jd.candidates?.filter(c => c.analyses?.[0]?.score >= 80).length || 0}/{jd.candidates?.length || 0} ≥80%</span>
-                    <button onClick={() => deleteJD(jd.id)} className="text-red-400 text-sm hover:text-red-600">Remove</button>
-                  </div>
-                  <div className="p-4">
-                    <textarea defaultValue={jd.content} onBlur={e => updateJD(jd.id, jd.title, e.target.value)} placeholder="Paste job description here..." rows={4} className="w-full border rounded-lg p-3 text-sm text-gray-700 outline-none resize-none mb-4" />
-                    <div className="flex justify-between items-center mb-3">
-                      <span className="text-sm text-gray-400">{jd.candidates?.length || 0} candidates</span>
-                      <button onClick={() => addCandidate(jd.id)} className="text-sm border px-3 py-1 rounded-lg text-gray-600 hover:bg-gray-50">+ Add CV</button>
-                    </div>
-                    <div className="flex flex-col gap-3">
-                      {(jd.candidates || []).map(c => (
-                        <CandidateRow
-                          key={c.id}
-                          candidate={c}
-                          jd={jd}
-                          analyzing={analyzing === c.id}
-                          onAnalyze={() => analyzeCandidate(jd, c)}
-                          onUploadPDF={(file) => uploadPDF(file, c.id, jd.id)}
-                          onUpdateName={(name) => updateCandidate(c.id, jd.id, { name })}
-                          onUpdateCV={(cv_text) => updateCandidate(c.id, jd.id, { cv_text })}
-                          onUpdateStatus={(status) => updateCandidate(c.id, jd.id, { status })}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    </main>
+  if (loading) return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="text-gray-400 text-sm">Loading...</div>
+    </div>
   )
-}
-
-function CandidateRow({ candidate: c, jd, analyzing, onAnalyze, onUploadPDF, onUpdateName, onUpdateCV, onUpdateStatus }: {
-  candidate: Candidate
-  jd: JD
-  analyzing: boolean
-  onAnalyze: () => void
-  onUploadPDF: (file: File) => void
-  onUpdateName: (name: string) => void
-  onUpdateCV: (cv: string) => void
-  onUpdateStatus: (status: string) => void
-}) {
-  const [expanded, setExpanded] = useState(false)
-  const [activeSection, setActiveSection] = useState<'cv' | 'analysis' | 'report'>('cv')
-  const fileRef = useRef<HTMLInputElement>(null)
-  const analysis = c.analyses?.[0]
 
   return (
-    <div className="border rounded-lg overflow-hidden">
-      <div className="flex items-center gap-3 p-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
-        <span className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center text-xs font-semibold flex-shrink-0">{(c.name || '?')[0]}</span>
-        <input value={c.name} onChange={e => onUpdateName(e.target.value)} onClick={e => e.stopPropagation()} className="flex-1 border-none outline-none text-sm font-medium bg-transparent" />
-        {analysis && <span className={`text-xs px-2 py-1 rounded-full font-medium ${analysis.score >= 80 ? 'bg-green-100 text-green-700' : analysis.score >= 60 ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{analysis.score}%</span>}
-        <select value={c.status} onChange={e => { e.stopPropagation(); onUpdateStatus(e.target.value) }} onClick={e => e.stopPropagation()} className="text-xs border rounded px-2 py-1 text-gray-600 outline-none">
-          <option value="screened">Screened</option>
-          <option value="interviewed">Interviewed</option>
-          <option value="submitted">Submitted</option>
-          <option value="rejected">Rejected</option>
-        </select>
-        <button onClick={e => { e.stopPropagation(); onAnalyze() }} disabled={!jd.content || !c.cv_text || analyzing} className="text-xs bg-blue-600 text-white px-3 py-1 rounded-lg disabled:opacity-40">
-          {analyzing ? 'Analyzing...' : analysis ? 'Re-analyze' : 'Analyze'}
+    <div className="min-h-screen bg-gray-50">
+      <div className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between sticky top-0 z-10">
+        <div>
+          <h1 className="text-lg font-semibold text-gray-900">Recruitment Pipeline</h1>
+          <p className="text-xs text-gray-400">{jds.length} active role{jds.length !== 1 ? 's' : ''}</p>
+        </div>
+        <button
+          onClick={addJD}
+          className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700 transition"
+        >
+          + Add Role
         </button>
       </div>
 
-      {expanded && (
-        <div className="border-t p-3">
-          <div className="flex gap-3 mb-3 border-b pb-2">
-            {(['cv', 'analysis', 'report'] as const).map(s => (
-              <button key={s} onClick={() => setActiveSection(s)} className={`text-xs px-3 py-1 rounded-full ${activeSection === s ? 'bg-blue-600 text-white' : 'text-gray-500 hover:text-gray-700'}`}>
-                {s === 'cv' ? 'CV' : s === 'analysis' ? 'Analysis' : 'Report'}
-              </button>
-            ))}
-          </div>
-
-          {activeSection === 'cv' && (
-            <div>
-              <div className="flex gap-2 mb-2">
-                <button onClick={() => fileRef.current?.click()} className="text-xs border px-3 py-1 rounded-lg text-gray-600 hover:bg-gray-50">
-                  📎 Upload PDF
+      <div className="flex gap-4 p-6 overflow-x-auto min-h-[calc(100vh-65px)] items-start">
+        {jds.length === 0 && (
+          <div className="text-gray-400 text-sm m-auto">No roles yet. Click "+ Add Role" to start.</div>
+        )}
+        {jds.map(jd => (
+          <div key={jd.id} className="flex-shrink-0 w-80 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col">
+            <div className="p-4 border-b border-gray-100">
+              <div className="flex items-center justify-between mb-2">
+                <input
+                  className="font-semibold text-sm text-gray-900 bg-transparent border-none outline-none w-full"
+                  value={jd.title ?? ''}
+                  onChange={e => updateJD(jd.id, 'title', e.target.value)}
+                  onBlur={e => updateJD(jd.id, 'title', e.target.value)}
+                />
+                <div className="flex gap-1 ml-2 flex-shrink-0">
+                  <button onClick={() => toggleCollapse(jd.id)} className="text-gray-400 hover:text-gray-600 text-xs px-1">
+                    {jd.collapsed ? '▼' : '▲'}
+                  </button>
+                  <button onClick={() => deleteJD(jd.id)} className="text-gray-300 hover:text-red-400 text-xs px-1">✕</button>
+                </div>
+              </div>
+              <textarea
+                className="w-full text-xs text-gray-500 border border-gray-100 rounded-lg p-2 resize-none focus:outline-none focus:border-gray-300"
+                rows={3}
+                placeholder="Paste Job Description here..."
+                value={jd.content ?? ''}
+                onChange={e => updateJD(jd.id, 'content', e.target.value)}
+              />
+              <div className="flex items-center justify-between mt-2">
+                <span className="text-xs text-gray-400">{(jd.candidates || []).length} candidate{(jd.candidates || []).length !== 1 ? 's' : ''}</span>
+                <button
+                  onClick={() => addCandidate(jd.id)}
+                  className="text-xs bg-gray-100 hover:bg-gray-200 px-3 py-1 rounded-lg text-gray-700 transition"
+                >
+                  + Add Candidate
                 </button>
-                <input ref={fileRef} type="file" accept=".pdf" className="hidden" onChange={e => {
-                  const file = e.target.files?.[0]
-                  if (file) onUploadPDF(file)
-                }} />
-                <span className="text-xs text-gray-400 flex items-center">or paste below</span>
               </div>
-              <textarea value={c.cv_text} onChange={e => onUpdateCV(e.target.value)} placeholder="Paste CV text here..." rows={6} className="w-full border rounded p-2 text-xs text-gray-600 outline-none resize-none" />
             </div>
-          )}
 
-          {activeSection === 'analysis' && analysis && (
-            <div className="flex flex-col gap-4">
-              <div className="flex items-center gap-3">
-                <span className="text-3xl font-bold">{analysis.score}%</span>
-                <span className="text-sm text-gray-400">overall match</span>
-              </div>
-              <div className="flex flex-col gap-2">
-                {[
-                  { label: 'Technical', value: analysis.technicalMatch },
-                  { label: 'Experience', value: analysis.experienceMatch },
-                  { label: 'Industry', value: analysis.industryMatch },
-                  { label: 'Seniority', value: analysis.seniorityMatch },
-                ].map(b => (
-                  <div key={b.label} className="flex items-center gap-3">
-                    <span className="text-xs text-gray-400 w-20">{b.label}</span>
-                    <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
-                      <div className={`h-full rounded-full ${b.value >= 80 ? 'bg-green-500' : b.value >= 60 ? 'bg-yellow-500' : 'bg-red-400'}`} style={{ width: `${b.value}%` }} />
+            {!jd.collapsed && (
+              <div className="p-3 flex flex-col gap-3 overflow-y-auto max-h-[600px]">
+                {(jd.candidates || []).map(c => {
+                  const latestAnalysis = c.analyses?.[0]
+                  const isAnalyzing = analyzing.has(c.id)
+                  return (
+                    <div key={c.id} className="border border-gray-100 rounded-lg p-3 bg-gray-50">
+                      <div className="flex items-center justify-between mb-2">
+                        <input
+                          className="text-xs font-medium text-gray-800 bg-transparent border-none outline-none w-full"
+                          value={c.name ?? ''}
+                          onChange={e => updateCandidate(jd.id, c.id, 'name', e.target.value)}
+                          onBlur={e => updateCandidate(jd.id, c.id, 'name', e.target.value)}
+                        />
+                        <button onClick={() => deleteCandidate(jd.id, c.id)} className="text-gray-300 hover:text-red-400 text-xs ml-1">✕</button>
+                      </div>
+
+                      {latestAnalysis && (
+                        <div className="mb-2 flex items-center gap-2">
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                            latestAnalysis.score >= 80 ? 'bg-green-100 text-green-700' :
+                            latestAnalysis.score >= 60 ? 'bg-yellow-100 text-yellow-700' :
+                            'bg-red-100 text-red-600'
+                          }`}>{latestAnalysis.score}%</span>
+                          <span className="text-xs text-gray-400 truncate">{latestAnalysis.summary?.slice(0, 50)}...</span>
+                        </div>
+                      )}
+
+                      <select
+                        value={c.status ?? 'screened'}
+                        onChange={e => updateCandidate(jd.id, c.id, 'status', e.target.value)}
+                        className={`text-xs px-2 py-0.5 rounded-full border-none mb-2 ${statusColors[c.status] || statusColors.screened}`}
+                      >
+                        <option value="screened">Screened</option>
+                        <option value="interviewing">Interviewing</option>
+                        <option value="offer">Offer</option>
+                        <option value="rejected">Rejected</option>
+                      </select>
+
+                      <div className="flex gap-2 mb-2">
+                        <label
+                          className={`text-xs border px-2 py-1 rounded-lg cursor-pointer transition ${
+                            c.uploading ? 'bg-blue-50 text-blue-500 border-blue-200' : 'text-gray-500 hover:bg-gray-100'
+                          }`}
+                          onClick={e => e.stopPropagation()}
+                        >
+                          {c.uploading ? '⏳ Parsing...' : '📎 Upload CV'}
+                          <input
+                            type="file"
+                            accept=".pdf"
+                            className="hidden"
+                            onClick={e => e.stopPropagation()}
+                            onChange={e => {
+                              const file = e.target.files?.[0]
+                              if (file) uploadPDF(jd.id, c.id, file)
+                            }}
+                          />
+                        </label>
+                        {c.cv_text && <span className="text-xs text-green-500 self-center">✓ CV loaded</span>}
+                      </div>
+
+                      <textarea
+                        className="w-full text-xs border border-gray-100 rounded-lg p-2 resize-none focus:outline-none focus:border-gray-300 mb-2"
+                        rows={2}
+                        placeholder="Or paste CV text..."
+                        value={c.cv_text ?? ''}
+                        onChange={e => updateCandidate(jd.id, c.id, 'cv_text', e.target.value)}
+                      />
+
+                      <textarea
+                        className="w-full text-xs border border-gray-100 rounded-lg p-2 resize-none focus:outline-none focus:border-gray-300 mb-2"
+                        rows={2}
+                        placeholder="Call notes (optional)..."
+                        value={c.call_notes ?? ''}
+                        onChange={e => updateCandidate(jd.id, c.id, 'call_notes', e.target.value)}
+                      />
+
+                      <button
+                        onClick={() => analyze(jd.id, c.id)}
+                        disabled={isAnalyzing || !c.cv_text || !jd.content}
+                        className={`w-full text-xs py-1.5 rounded-lg transition font-medium ${
+                          isAnalyzing ? 'bg-blue-100 text-blue-500 cursor-wait' :
+                          (!c.cv_text || !jd.content) ? 'bg-gray-100 text-gray-400 cursor-not-allowed' :
+                          'bg-gray-900 text-white hover:bg-gray-700'
+                        }`}
+                      >
+                        {isAnalyzing ? '⏳ Analyzing...' : '↗ Analyze'}
+                      </button>
+
+                      {latestAnalysis && !isAnalyzing && (
+                        <div className="mt-2 pt-2 border-t border-gray-100">
+                          <div className="text-xs text-gray-500 font-medium mb-1">Gaps:</div>
+                          {Object.entries(latestAnalysis.gaps || {}).map(([k, v]) =>
+                            (v as string[]).length > 0 ? (
+                              <div key={k} className="text-xs text-red-500">• {(v as string[]).join(', ')}</div>
+                            ) : null
+                          )}
+                          {latestAnalysis.strengths?.slice(0, 2).map((s, i) => (
+                            <div key={i} className="text-xs text-green-600">✓ {s}</div>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <span className="text-xs font-medium w-8 text-right">{b.value}%</span>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
-              {analysis.strengths?.length > 0 && (
-                <div>
-                  <div className="text-xs font-medium text-gray-500 mb-1">Strengths</div>
-                  {analysis.strengths.map((s, i) => <div key={i} className="text-xs flex gap-2"><span className="text-green-500">✓</span>{s}</div>)}
-                </div>
-              )}
-              {analysis.interviewQuestions?.length > 0 && (
-                <div>
-                  <div className="text-xs font-medium text-gray-500 mb-1">Screening questions</div>
-                  {analysis.interviewQuestions.map((q, i) => (
-                    <div key={i} className="text-xs bg-gray-50 rounded p-2 mb-1"><span className="text-gray-400 mr-1">{i+1}.</span>{q}</div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-
-          {activeSection === 'report' && analysis && (
-            <div>
-              <div className="flex justify-end mb-2">
-                <button onClick={() => navigator.clipboard?.writeText(analysis.report)} className="text-xs border px-3 py-1 rounded-lg text-gray-600">Copy report</button>
-              </div>
-              <div className="text-xs bg-gray-50 rounded p-3 whitespace-pre-wrap leading-relaxed">{analysis.report}</div>
-            </div>
-          )}
-
-          {activeSection === 'analysis' && !analysis && (
-            <div className="text-xs text-gray-400 text-center py-4">Run analysis first to see results.</div>
-          )}
-        </div>
-      )}
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

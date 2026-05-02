@@ -5,19 +5,16 @@ import { NextRequest } from 'next/server'
 const client = new Anthropic()
 
 export async function POST(req: NextRequest) {
-  const { candidateId, jdContent, cvText, callNotes } = await req.json()
+  try {
+    const { candidateId, jdContent, cvText, callNotes } = await req.json()
 
-  const encoder = new TextEncoder()
-  const stream = new TransformStream()
-  const writer = stream.writable.getWriter()
-
-  const systemPrompt = `You are an expert technical recruiter. 
+    const systemPrompt = `You are an expert technical recruiter. 
 Analyze CVs against Job Descriptions and return ONLY a valid JSON object.
 No markdown, no explanation — pure JSON.`
 
-  const userMessage = `JOB DESCRIPTION:\n${jdContent}\n\nCV:\n${cvText}${
-    callNotes ? `\n\nSCREENING CALL NOTES:\n${callNotes}` : ''
-  }
+    const userMessage = `JOB DESCRIPTION:\n${jdContent}\n\nCV:\n${cvText}${
+      callNotes ? `\n\nSCREENING CALL NOTES:\n${callNotes}` : ''
+    }
 
 Return this exact JSON structure:
 {
@@ -38,49 +35,33 @@ Return this exact JSON structure:
   "report": "<full formatted candidate report>"
 }`
 
-  ;(async () => {
-    let fullText = ''
-    const anthropicStream = await client.messages.stream({
+    const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2000,
       system: systemPrompt,
       messages: [{ role: 'user', content: userMessage }],
     })
 
-    for await (const chunk of anthropicStream) {
-      if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
-        fullText += chunk.delta.text
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ partial: fullText })}\n\n`))
-      }
-    }
+    const text = response.content[0].type === 'text' ? response.content[0].text : ''
+    const parsed = JSON.parse(text)
 
-    try {
-      const parsed = JSON.parse(fullText)
-      await supabaseAdmin.from('analyses').insert({
-        candidate_id: candidateId,
-        score: parsed.score,
-        technical_match: parsed.technicalMatch,
-        experience_match: parsed.experienceMatch,
-        industry_match: parsed.industryMatch,
-        seniority_match: parsed.seniorityMatch,
-        strengths: parsed.strengths,
-        gaps: parsed.gaps,
-        interview_questions: parsed.interviewQuestions,
-        summary: parsed.summary,
-        report: parsed.report,
-      })
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ done: true, result: parsed })}\n\n`))
-    } catch {
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ error: 'Parse failed' })}\n\n`))
-    }
-    await writer.close()
-  })()
+    await supabaseAdmin.from('analyses').insert({
+      candidate_id: candidateId,
+      score: parsed.score,
+      technical_match: parsed.technicalMatch,
+      experience_match: parsed.experienceMatch,
+      industry_match: parsed.industryMatch,
+      seniority_match: parsed.seniorityMatch,
+      strengths: parsed.strengths,
+      gaps: parsed.gaps,
+      interview_questions: parsed.interviewQuestions,
+      summary: parsed.summary,
+      report: parsed.report,
+    })
 
-  return new Response(stream.readable, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    },
-  })
+    return Response.json({ result: parsed })
+  } catch (err) {
+    console.error('Analyze error:', err)
+    return Response.json({ error: 'Failed to analyze' }, { status: 500 })
+  }
 }
